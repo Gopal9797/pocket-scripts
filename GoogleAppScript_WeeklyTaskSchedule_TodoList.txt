@@ -1,0 +1,219 @@
+Step-by-Step Setup (Takes 2 Minutes)
+In your spreadsheet, click Extensions > Apps Script.
+Delete any existing code in the editor window and paste the complete script below.
+Click the Save icon (disk icon or Ctrl + S / Cmd + S).
+Refresh your Google Spreadsheet tab. You will see a new menu appear at the top: 📅 Schedule Hub.
+Click 📅 Schedule Hub > Enable Auto-Create Every Monday (Google will ask you to authorize Calendar and Sheets access once).
+The Google Apps Script Code
+Javascript
+/**
+ * Weekly Schedule & Google Calendar Sync Hub
+ */
+
+// Configuration constants
+const TEMPLATE_SHEET_NAME = 'Oct26-30'; // Tab used as the layout blueprint
+const CALENDAR_SYNC_SHEET = 'Calendar_Sync';
+const START_ROW = 8;
+const END_ROW = 33;
+
+/**
+ * Creates custom menu when spreadsheet is opened
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('📅 Schedule Hub')
+    .addItem("🔄 Sync Today's Meetings", 'syncTodayMeetings')
+    .addItem("📑 Create This Week's Sheet", 'createCurrentWeekSheet')
+    .addSeparator()
+    .addItem("⏰ Enable Auto-Create Every Monday", 'setupWeeklyTrigger')
+    .addToUi();
+}
+
+/**
+ * 1. MANUAL DAILY SYNC: Updates only today's column with latest Google Calendar meetings
+ */
+function syncTodayMeetings() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const today = new Date();
+  
+  // Day index: Monday = 1, Tuesday = 2, ..., Friday = 5
+  const dayOfWeek = today.getDay(); 
+  if (dayOfWeek < 1 || dayOfWeek > 5) {
+    SpreadsheetApp.getUi().alert("Today is a weekend. Daily sync operates Monday through Friday.");
+    return;
+  }
+  
+  // Column mapping: Monday=D (col 4), Tuesday=E (col 5), ..., Friday=H (col 8)
+  const targetCol = dayOfWeek + 3;
+  
+  // Date boundaries for today (9:00 AM to 10:00 PM)
+  const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 9, 0, 0);
+  const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 22, 0, 0);
+  
+  const calendar = CalendarApp.getDefaultCalendar();
+  const events = calendar.getEvents(startOfDay, endOfDay);
+  
+  // Slot times: Row 8 = 9:00 AM, each row is 30 minutes
+  events.forEach(event => {
+    const eventStart = event.getStartTime();
+    const startHour = eventStart.getHours();
+    const startMin = eventStart.getMinutes();
+    
+    // Calculate row index based on 9:00 AM start
+    const slotIndex = Math.floor(((startHour - 9) * 60 + startMin) / 30);
+    const row = START_ROW + slotIndex;
+    
+    if (row >= START_ROW && row <= END_ROW) {
+      const cell = sheet.getRange(row, targetCol);
+      // Place event title if cell is empty or previously held a meeting
+      if (!cell.getValue() || cell.getValue() === "") {
+        cell.setValue(event.getTitle());
+      }
+      
+      // Update backend archive to maintain blue conditional formatting
+      addEventToSyncArchive(ss, event);
+    }
+  });
+  
+  SpreadsheetApp.getActiveSpreadsheet().toast("Today's meetings have been refreshed!", "Sync Complete", 4);
+}
+
+/**
+ * 2. WEEKLY TEMPLATE CREATOR: Clones the template, sets dates, and syncs full week
+ */
+function createCurrentWeekSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const template = ss.getSheetByName(TEMPLATE_SHEET_NAME);
+  
+  if (!template) {
+    SpreadsheetApp.getUi().alert(`Template sheet '${TEMPLATE_SHEET_NAME}' was not found.`);
+    return;
+  }
+  
+  // Calculate Monday of the current/upcoming week
+  const today = new Date();
+  const day = today.getDay();
+  const diffToMonday = today.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(today.setDate(diffToMonday));
+  const friday = new Date(monday);
+  friday.setDate(monday.getDate() + 4);
+  
+  // Format tab name: e.g. "Nov2-6"
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const newSheetName = `${monthNames[monday.getMonth()]}${monday.getDate()}-${friday.getDate()}`;
+  
+  // Prevent duplicate tab creation
+  if (ss.getSheetByName(newSheetName)) {
+    SpreadsheetApp.getUi().alert(`Sheet '${newSheetName}' already exists.`);
+    return;
+  }
+  
+  // Clone template sheet
+  const newSheet = template.copyTo(ss);
+  newSheet.setName(newSheetName);
+  ss.setActiveSheet(newSheet);
+  ss.moveActiveSheet(1); // Place as first tab
+  
+  // Update Header Banner (Cell B2)
+  newSheet.getRange("B2").setValue(
+    `WEEKLY SCHEDULE & TASK MANAGEMENT HUB • Week of ${monthNames[monday.getMonth()]} ${monday.getDate()} - ${monthNames[friday.getMonth()]} ${friday.getDate()}, ${monday.getFullYear()}`
+  );
+  
+  // Update Day Headers (D7:H7)
+  const days = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"];
+  for (let i = 0; i < 5; i++) {
+    const currentDay = new Date(monday);
+    currentDay.setDate(monday.getDate() + i);
+    const dateStr = `${currentDay.getMonth() + 1}/${currentDay.getDate()}`;
+    newSheet.getRange(7, 4 + i).setValue(`${days[i]} ${dateStr}`);
+  }
+  
+  // Clear previous week's schedule events (D8:H33) & tasks (K8:O33) & recaps (D36:H39)
+  newSheet.getRange("D8:H33").clearContent();
+  newSheet.getRange("K8:L33").clearContent(); // Clear description and project
+  newSheet.getRange("O8:O33").clearContent(); // Clear due date
+  newSheet.getRange("N8:N33").setValue("Not Started"); // Reset status chips
+  newSheet.getRange("D36:H39").clearContent(); // Clear daily recap notes
+  
+  // Populate all calendar events for the new week
+  syncFullWeekCalendar(ss, newSheet, monday, friday);
+  
+  SpreadsheetApp.getActiveSpreadsheet().toast(`Created and synced ${newSheetName}!`, "Success", 5);
+}
+
+/**
+ * Pulls all events from Monday to Friday into the newly created sheet
+ */
+function syncFullWeekCalendar(ss, targetSheet, monday, friday) {
+  const startOfWeek = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate(), 9, 0, 0);
+  const endOfWeek = new Date(friday.getFullYear(), friday.getMonth(), friday.getDate(), 22, 0, 0);
+  
+  const calendar = CalendarApp.getDefaultCalendar();
+  const events = calendar.getEvents(startOfWeek, endOfWeek);
+  
+  events.forEach(event => {
+    const eventStart = event.getStartTime();
+    const dayOfWeek = eventStart.getDay(); // Mon=1 ... Fri=5
+    
+    if (dayOfWeek >= 1 && dayOfWeek <= 5) {
+      const col = dayOfWeek + 3;
+      const startHour = eventStart.getHours();
+      const startMin = eventStart.getMinutes();
+      
+      const slotIndex = Math.floor(((startHour - 9) * 60 + startMin) / 30);
+      const row = START_ROW + slotIndex;
+      
+      if (row >= START_ROW && row <= END_ROW) {
+        targetSheet.getRange(row, col).setValue(event.getTitle());
+        addEventToSyncArchive(ss, event);
+      }
+    }
+  });
+}
+
+/**
+ * Ensures calendar events are logged in Calendar_Sync to preserve blue conditional formatting
+ */
+function addEventToSyncArchive(ss, event) {
+  const archiveSheet = ss.getSheetByName(CALENDAR_SYNC_SHEET);
+  if (!archiveSheet) return;
+  
+  const titles = archiveSheet.getRange("A2:A" + Math.max(archiveSheet.getLastRow(), 2)).getValues().flat();
+  if (!titles.includes(event.getTitle())) {
+    archiveSheet.appendRow([
+      event.getTitle(),
+      event.getDescription() || '',
+      event.getLocation() || '',
+      event.getStartTime(),
+      event.getEndTime(),
+      event.getId()
+    ]);
+  }
+}
+
+/**
+ * 3. WEEKLY TRIGGER: Automatically creates the new week sheet every Monday at 6:00 AM
+ */
+function setupWeeklyTrigger() {
+  // Remove duplicate triggers if already installed
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'createCurrentWeekSheet') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // Set trigger for every Monday between 6am and 7am
+  ScriptApp.newTrigger('createCurrentWeekSheet')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(6)
+    .create();
+    
+  SpreadsheetApp.getUi().alert("Automation active: A new sheet will be created and synced every Monday at 6:00 AM.");
+}
+How It Works Together
+Preserves Your Work: Clearing or typing over a meeting automatically drops the blue highlight, maintaining your focus work tracking.
+Dynamic Headers: When a new sheet is spawned (e.g., Nov2-6), date headers (MONDAY 11/2, etc.) and the top banner update automatically.
+Daily Ad-hoc Meetings: If an organizer books a meeting mid-day, simply click 📅 Schedule Hub > Sync Today's Meetings to pull it directly into today's schedule column.
